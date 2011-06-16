@@ -24,7 +24,7 @@
 #include "apr_strings.h"
 
 #define PRODUCT_NAME "mod_amend"
-#define PRODUCT_VERSION "0.0.3"
+#define PRODUCT_VERSION "0.0.4"
 
 // logging
 
@@ -86,8 +86,7 @@ static int amender( request_rec *r, amend_cfg *cfg )
 					rv = HTTP_NOT_FOUND;
 				}
 				if( rv != HTTP_NOT_FOUND && 
-					( tail = strstr( head, cfg->skip_to ) ) && 
-					strcmp( head, tail ) != 0 )
+					( tail = strstr( head, cfg->skip_to ) ) )
 				{
 					if( cfg->skip_rep && *cfg->skip_rep )
 					{
