@@ -18,12 +18,13 @@
 #include "http_log.h"
 #include "http_core.h"
 #include "http_config.h"
+#include "http_request.h"
 #include "ap_config.h"
 #include "apr.h"
 #include "apr_strings.h"
 
 #define PRODUCT_NAME "mod_amend"
-#define PRODUCT_VERSION "0.0.1"
+#define PRODUCT_VERSION "0.0.2"
 
 // logging
 
@@ -48,17 +49,16 @@ typedef struct {
 	const char *query_from;
 	const char *query_to;
 	const char *query_sep;
-} dir_cfg;
+} amend_cfg;
 
 /* global module structure */
 module AP_MODULE_DECLARE_DATA amend_module;
 
-static int translate_name( request_rec *r )
+static int amender( request_rec *r, amend_cfg *cfg )
 {
 	int rc = DECLINED;
-	dir_cfg *cfg = NULL;
 	
-	if( !r->main && !r->prev && ( cfg = ap_get_module_config( r->per_dir_config , &amend_module ) ) )
+	if( cfg->skip_from || cfg->query_from )
 	{
 		size_t len = strlen( r->unparsed_uri );
 		char *uri = calloc( sizeof( char ), len + 1 );
@@ -72,8 +72,8 @@ static int translate_name( request_rec *r )
 			char *qry = NULL;
 			char *head = NULL;
 			char *tail = NULL;
-			int rv;
-			
+			int rv = OK;
+
 			memcpy( uri, r->unparsed_uri, len );
 			
 			if( cfg->skip_from )
@@ -82,30 +82,27 @@ static int translate_name( request_rec *r )
 					head = uri;
 				}
 				else if( !( head = strstr( uri, cfg->skip_from ) ) ){
-					rc = HTTP_NOT_FOUND;
+					rv = HTTP_NOT_FOUND;
 				}
-				
-				if( rc == HTTP_NOT_FOUND || !( tail = strstr( head, cfg->skip_to ) ) ){
-					rc = DECLINED;
-				}
-				else {
+				if( rv != HTTP_NOT_FOUND && 
+					( tail = strstr( head, cfg->skip_to ) ) && 
+					strcmp( head, tail ) != 0 )
+				{
 					len = strlen( tail );
 					memmove( (void*)head, tail, len + 1 );
+					rc = OK;
 				}
 			}
-
+			
 			if( cfg->query_from && ( head = strstr( uri, cfg->query_from ) ) )
 			{
 				tail = NULL;
 				if( strcmp( cfg->query_to, "$" ) != 0 && 
 					!( tail = strstr( head, cfg->query_to ) ) ){
-					rc = HTTP_NOT_FOUND;
+					rv = HTTP_NOT_FOUND;
 				}
 				
-				if( rc == HTTP_NOT_FOUND ){
-					rc = DECLINED;
-				}
-				else
+				if( rv != HTTP_NOT_FOUND )
 				{
 					size_t qlen = strlen( head );
 					
@@ -117,6 +114,7 @@ static int translate_name( request_rec *r )
 					}
 					else
 					{
+						rc = OK;
 						memcpy( qry, head + strlen( cfg->query_from ), qlen );
 						if( tail ){
 							memmove( head, tail, len + 1 );
@@ -137,19 +135,40 @@ static int translate_name( request_rec *r )
 				}
 			}
 			
-			if( rc == DECLINED )
+			if( rc == OK )
 			{
-				r->uri = apr_pstrdup( r->pool, uri );
 				if( qry ){
 					r->unparsed_uri = apr_pstrcat( r->pool, uri, "?", qry, NULL );
+					r->args = apr_pstrdup( r->pool, qry );
+					r->parsed_uri.query = apr_pstrdup( r->pool, qry );
 					free( qry );
 				}
 				else {
 					r->unparsed_uri = apr_pstrdup( r->pool, uri );
 				}
+				r->uri = apr_pstrdup( r->pool, uri );
+				r->parsed_uri.path = apr_pstrdup( r->pool, uri );
+				r->path_info = "";
+				r->filename = NULL;
+				r->canonical_filename = NULL;
 				free( uri );
-				ap_parse_uri( r, r->unparsed_uri );
 			}
+		}
+	}
+	
+	return rc;
+}
+
+static int translate_name( request_rec *r )
+{
+	int rc = DECLINED;
+	amend_cfg *cfg = NULL;
+	
+	if( !r->main && !r->prev )
+	{
+		if( ( cfg = ap_get_module_config( r->server->module_config , &amend_module ) ) &&
+			( rc = amender( r, cfg ) ) != HTTP_INTERNAL_SERVER_ERROR ){
+			rc = DECLINED;
 		}
 	}
 	
@@ -179,7 +198,6 @@ static int post_config( apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp, 
 	return rc;
 }
 
-
 static void register_hooks( apr_pool_t *p )
 {
 	static const char * const asz[]={ "mod_rewrite.c", "mod_proxy.c", NULL };
@@ -188,21 +206,22 @@ static void register_hooks( apr_pool_t *p )
 }
 
 /* MARK: Configuration */
-static void *create_dir_config( apr_pool_t *p, char *dir )
+static void *create_server_config( apr_pool_t *p, server_rec *server )
 {
-	apr_status_t rc;
-	dir_cfg *cfg = NULL;
+	amend_cfg *cfg = NULL;
+	apr_status_t rc = APR_SUCCESS;
 	apr_pool_t *sp = NULL;
 	
+	// create sub-pool
 	if( ( rc = apr_pool_create( &sp, p ) ) ){
-		ap_log_perror( APLOG_MARK, APLOG_ERR, 0, p, "failed to apr_pool_create(): %s", LOG_APR_STRERROR( rc ) );
+		LOG_SERROR( server, APLOG_ERR, "failed to apr_pool_create(): %s", LOG_APR_STRERROR( rc ) );
 	}
-	else if( !( cfg = apr_pcalloc( sp, sizeof( dir_cfg ) ) ) ){
-		ap_log_perror( APLOG_MARK, APLOG_ERR, 0, p, "failed to apr_pcalloc(): %s", LOG_APR_STRERROR( APR_ENOMEM ) );
+	// allocate amend_cfg
+	else if( !( cfg = apr_pcalloc( sp, sizeof( amend_cfg ) ) ) ){
+		LOG_SERROR( server, APLOG_ERR, "failed to apr_pcalloc(): %s", LOG_APR_STRERROR( APR_ENOMEM ) );
 		apr_pool_destroy( sp );
-		cfg = NULL;
 	}
-	else {
+	else{
 		cfg->p = sp;
 		cfg->skip_from = NULL;
 		cfg->skip_to = NULL;
@@ -214,11 +233,11 @@ static void *create_dir_config( apr_pool_t *p, char *dir )
 	return cfg;
 }
 
-static void *merge_dir_config( apr_pool_t *p, void *parent_conf, void *newloc_conf )
+static void *merge_server_config( apr_pool_t *p, void *parent_conf, void *newloc_conf )
 {
-	dir_cfg *merged = (dir_cfg*)apr_pcalloc( p, sizeof( dir_cfg ) );
-	dir_cfg *parent = (dir_cfg*)parent_conf;
-	dir_cfg *child = (dir_cfg*)newloc_conf;
+	amend_cfg *merged = (amend_cfg*)apr_pcalloc( p, sizeof( amend_cfg ) );
+	amend_cfg *parent = (amend_cfg*)parent_conf;
+	amend_cfg *child = (amend_cfg*)newloc_conf;
 	
 	merged->p = p;
 	merged->skip_from = ( child->skip_from ) ? child->skip_from : parent->skip_from;
@@ -234,21 +253,19 @@ static void *merge_dir_config( apr_pool_t *p, void *parent_conf, void *newloc_co
 /* MARK: Command Directive */
 static const char *cmd_set_amend_skip( cmd_parms *cmd, void *mconfig, const char *from, const char *to )
 {
-	dir_cfg *cfg = (dir_cfg*)mconfig;
-	const char *errstr = NULL;
+	amend_cfg *cfg = ap_get_module_config( cmd->server->module_config , &amend_module );
 	
 	if( cfg ){
 		cfg->skip_from = from;
 		cfg->skip_to = to;
 	}
 	
-	return errstr;
+	return NULL;
 }
 
 static const char *cmd_set_amend_query( cmd_parms *cmd, void *mconfig, const char *from, const char *to, const char *sep )
 {
-	dir_cfg *cfg = (dir_cfg*)mconfig;
-	const char *errstr = NULL;
+	amend_cfg *cfg = ap_get_module_config( cmd->server->module_config , &amend_module );
 	
 	if( cfg ){
 		cfg->query_from = from;
@@ -256,7 +273,7 @@ static const char *cmd_set_amend_query( cmd_parms *cmd, void *mconfig, const cha
 		cfg->query_sep = sep;
 	}
 	
-	return errstr;
+	return NULL;
 }
 
 static const command_rec cmd_table[] =
@@ -265,14 +282,14 @@ static const command_rec cmd_table[] =
 		"AmendSkip",
 		cmd_set_amend_skip,
 		NULL,
-		OR_FILEINFO,
+		RSRC_CONF,
 		""
 	),
 	AP_INIT_TAKE3(
 		"AmendQuery",
 		cmd_set_amend_query,
 		NULL,
-		OR_FILEINFO,
+		RSRC_CONF,
 		""
 	),
 	{NULL}
@@ -281,92 +298,11 @@ static const command_rec cmd_table[] =
 /* Dispatch list for API hooks */
 module AP_MODULE_DECLARE_DATA amend_module = {
     STANDARD20_MODULE_STUFF, 
-    create_dir_config,  /* create per-dir    config structures */
-    merge_dir_config,   /* merge  per-dir    config structures */
-    NULL,               /* create per-server config structures */
-    NULL,               /* merge  per-server config structures */
-    cmd_table,          /* table of config file commands       */
-    register_hooks      /* register hooks                      */
+    NULL,					/* create per-dir    config structures */
+    NULL,					/* merge  per-dir    config structures */
+    create_server_config,	/* create per-server config structures */
+    merge_server_config,	/* merge  per-server config structures */
+    cmd_table,				/* table of config file commands       */
+    register_hooks			/* register hooks                      */
 };
 
-
-/* MARK: Utilities 
-static void ShowProps( request_rec *r )
-{
-	LOG_RERROR( r, APLOG_ERR, "       the_request: %s", r->the_request );
-	LOG_RERROR( r, APLOG_ERR, "      assbackwords: %d", r->assbackwards );
-	LOG_RERROR( r, APLOG_ERR, "          proxyreq: %d", r->proxyreq );
-	LOG_RERROR( r, APLOG_ERR, "       header_only: %d", r->header_only );
-	LOG_RERROR( r, APLOG_ERR, "          protocol: %s", r->protocol );
-	LOG_RERROR( r, APLOG_ERR, "         proto_num: %d", r->proto_num );
-	LOG_RERROR( r, APLOG_ERR, "          hostname: %s", r->hostname );
-	LOG_RERROR( r, APLOG_ERR, "      request_time: %lld", r->request_time );
-	LOG_RERROR( r, APLOG_ERR, "       status_line: %s", r->status_line );
-	LOG_RERROR( r, APLOG_ERR, "            status: %d", r->status );
-	LOG_RERROR( r, APLOG_ERR, "            method: %s", r->method );
-	LOG_RERROR( r, APLOG_ERR, "     method_number: %d", r->method_number );
-	LOG_RERROR( r, APLOG_ERR, "           allowed: %ld", r->allowed );
-	LOG_RERROR( r, APLOG_ERR, "       sent_bodyct: %lu", r->sent_bodyct );
-	LOG_RERROR( r, APLOG_ERR, "        bytes_sent: %lu", r->bytes_sent );
-	LOG_RERROR( r, APLOG_ERR, "             mtime: %lld", r->mtime );
-	LOG_RERROR( r, APLOG_ERR, "           chunked: %d", r->chunked );
-	LOG_RERROR( r, APLOG_ERR, "             range: %s", r->range );
-	LOG_RERROR( r, APLOG_ERR, "           clength: %ld", r->clength );
-	LOG_RERROR( r, APLOG_ERR, "         remaining: %ld", r->remaining );
-	LOG_RERROR( r, APLOG_ERR, "       read_length: %ld", r->read_length );
-	LOG_RERROR( r, APLOG_ERR, "         read_body: %d", r->read_body );
-	LOG_RERROR( r, APLOG_ERR, "      read_chunked: %d", r->read_chunked );
-	LOG_RERROR( r, APLOG_ERR, "     expecting_100: %u", r->expecting_100 );
-	LOG_RERROR( r, APLOG_ERR, "      content_type: %s", r->content_type );
-	LOG_RERROR( r, APLOG_ERR, "           handler: %s", r->handler );
-	LOG_RERROR( r, APLOG_ERR, "  content_encoding: %s", r->content_encoding );
-	LOG_RERROR( r, APLOG_ERR, "   vlist_validator: %s", r->vlist_validator );
-	LOG_RERROR( r, APLOG_ERR, "              user: %s", r->user );
-	LOG_RERROR( r, APLOG_ERR, "      ap_auth_type: %s", r->ap_auth_type );
-	LOG_RERROR( r, APLOG_ERR, "          no_cache: %d", r->no_cache );
-	LOG_RERROR( r, APLOG_ERR, "     no_local_copy: %d", r->no_local_copy );
-	LOG_RERROR( r, APLOG_ERR, "      unparsed_uri: %s", r->unparsed_uri );
-	LOG_RERROR( r, APLOG_ERR, "               uri: %s", r->uri );
-	LOG_RERROR( r, APLOG_ERR, "          filename: %s", r->filename );
-	LOG_RERROR( r, APLOG_ERR, "canonical_filename: %s", r->canonical_filename );
-	LOG_RERROR( r, APLOG_ERR, "         path_info: %s", r->path_info );
-	LOG_RERROR( r, APLOG_ERR, "              args: %s", r->args );
-	LOG_RERROR( r, APLOG_ERR, "    used_path_info: %d", r->used_path_info );
-	LOG_RERROR( r, APLOG_ERR, "          eos_sent: %d", r->eos_sent );
-	LOG_RERROR( r, APLOG_ERR, "      ap_auth_type: %s", ap_auth_type(r) );
-
-	LOG_RERROR( r, APLOG_ERR, "             finfo ->" );
-	LOG_RERROR( r, APLOG_ERR, "                 valid: %d", r->finfo.valid );
-	LOG_RERROR( r, APLOG_ERR, "            protection: %d", r->finfo.protection );
-	LOG_RERROR( r, APLOG_ERR, "              filetype: %d", r->finfo.filetype );
-	LOG_RERROR( r, APLOG_ERR, "                  user: %d", r->finfo.user );
-	LOG_RERROR( r, APLOG_ERR, "                 group: %d", r->finfo.group );
-	LOG_RERROR( r, APLOG_ERR, "                 inode: %d", r->finfo.inode );
-	LOG_RERROR( r, APLOG_ERR, "                device: %u", r->finfo.device );
-	LOG_RERROR( r, APLOG_ERR, "                 nlink: %d", r->finfo.nlink );
-	LOG_RERROR( r, APLOG_ERR, "                  size: %lu", r->finfo.size );
-	LOG_RERROR( r, APLOG_ERR, "                 csize: %lu", r->finfo.csize );
-	LOG_RERROR( r, APLOG_ERR, "                 atime: %lu", r->finfo.atime );
-	LOG_RERROR( r, APLOG_ERR, "                 mtime: %lu", r->finfo.mtime );
-	LOG_RERROR( r, APLOG_ERR, "                 ctime: %lu", r->finfo.ctime );
-	LOG_RERROR( r, APLOG_ERR, "                 fname: %s", r->finfo.fname );
-	LOG_RERROR( r, APLOG_ERR, "                  name: %s", r->finfo.name );
-	LOG_RERROR( r, APLOG_ERR, "              filehand: %p", r->finfo.filehand );
-	
-	LOG_RERROR( r, APLOG_ERR, "        parsed_uri ->" );
-	LOG_RERROR( r, APLOG_ERR, "                scheme: %s", r->parsed_uri.scheme );
-	LOG_RERROR( r, APLOG_ERR, "              hostinfo: %s", r->parsed_uri.hostinfo );
-	LOG_RERROR( r, APLOG_ERR, "                  user: %s", r->parsed_uri.user );
-	LOG_RERROR( r, APLOG_ERR, "              password: %s", r->parsed_uri.password );
-	LOG_RERROR( r, APLOG_ERR, "              hostname: %s", r->parsed_uri.hostname );
-	LOG_RERROR( r, APLOG_ERR, "              port_str: %s", r->parsed_uri.port_str );
-	LOG_RERROR( r, APLOG_ERR, "                  path: %s", r->parsed_uri.path );
-	LOG_RERROR( r, APLOG_ERR, "                 query: %s", r->parsed_uri.query );
-	LOG_RERROR( r, APLOG_ERR, "              fragment: %s", r->parsed_uri.fragment );
-	// LOG_RERROR( r, APLOG_ERR, "            hostent: %s", r->parsed_uri.filehand );
-	LOG_RERROR( r, APLOG_ERR, "                  port: %d", r->parsed_uri.port );
-	LOG_RERROR( r, APLOG_ERR, "        is_initialized: %u", r->parsed_uri.is_initialized );
-	LOG_RERROR( r, APLOG_ERR, "         dns_looked_up: %u", r->parsed_uri.dns_looked_up );
-	LOG_RERROR( r, APLOG_ERR, "          dns_resolved: %u", r->parsed_uri.dns_resolved );
-}
-*/
