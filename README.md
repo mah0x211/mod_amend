@@ -9,7 +9,7 @@ amend request url
 ## Configuration
 write to outside <Directory> or <Location> on *.conf  
 
-    AmendSkip /skip_from/ /skip_to/
+    AmendSkip /skip_from/ /skip_to/ skip_replace
     AmendQuery /query_from/ /query_to/ query_separator
 
 **special characters**  

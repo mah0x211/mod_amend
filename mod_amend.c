@@ -24,7 +24,7 @@
 #include "apr_strings.h"
 
 #define PRODUCT_NAME "mod_amend"
-#define PRODUCT_VERSION "0.0.2"
+#define PRODUCT_VERSION "0.0.3"
 
 // logging
 
@@ -46,6 +46,7 @@ typedef struct {
 	apr_pool_t *p;
 	const char *skip_from;
 	const char *skip_to;
+	const char *skip_rep;
 	const char *query_from;
 	const char *query_to;
 	const char *query_sep;
@@ -88,13 +89,33 @@ static int amender( request_rec *r, amend_cfg *cfg )
 					( tail = strstr( head, cfg->skip_to ) ) && 
 					strcmp( head, tail ) != 0 )
 				{
-					len = strlen( tail );
-					memmove( (void*)head, tail, len + 1 );
-					rc = OK;
+					if( cfg->skip_rep && *cfg->skip_rep )
+					{
+						size_t rlen = strlen( cfg->skip_rep );
+						size_t tlen = strlen( cfg->skip_to );
+						size_t shift = rlen - tlen;
+						
+						if( shift > 0 && !( uri = realloc( uri, len + shift ) ) ){
+							LOG_RERROR( r, APLOG_ERR, "mod_amend: %s", strerror( errno ) );
+							rc = HTTP_INTERNAL_SERVER_ERROR;
+						}
+						else{
+							tail += tlen;
+							memmove( (void*)head + rlen, tail, strlen( tail ) + 1 );
+							memcpy( (void*)head, cfg->skip_rep, rlen );
+							rc = OK;
+						}
+					}
+					else {
+						memmove( (void*)head, tail, strlen( tail ) + 1 );
+						rc = OK;
+					}
 				}
 			}
 			
-			if( cfg->query_from && ( head = strstr( uri, cfg->query_from ) ) )
+			if( rc != HTTP_INTERNAL_SERVER_ERROR && 
+				cfg->query_from && 
+				( head = strstr( uri, cfg->query_from ) ) )
 			{
 				tail = NULL;
 				if( strcmp( cfg->query_to, "$" ) != 0 && 
@@ -137,6 +158,7 @@ static int amender( request_rec *r, amend_cfg *cfg )
 			
 			if( rc == OK )
 			{
+				apr_table_set( r->headers_out, "X-Amend-URI", r->unparsed_uri );
 				if( qry ){
 					r->unparsed_uri = apr_pstrcat( r->pool, uri, "?", qry, NULL );
 					r->args = apr_pstrdup( r->pool, qry );
@@ -225,6 +247,7 @@ static void *create_server_config( apr_pool_t *p, server_rec *server )
 		cfg->p = sp;
 		cfg->skip_from = NULL;
 		cfg->skip_to = NULL;
+		cfg->skip_rep = NULL;
 		cfg->query_from = NULL;
 		cfg->query_to = NULL;
 		cfg->query_sep = NULL;
@@ -242,6 +265,7 @@ static void *merge_server_config( apr_pool_t *p, void *parent_conf, void *newloc
 	merged->p = p;
 	merged->skip_from = ( child->skip_from ) ? child->skip_from : parent->skip_from;
 	merged->skip_to = ( child->skip_to ) ? child->skip_to : parent->skip_to;
+	merged->skip_rep = ( child->skip_rep ) ? child->skip_rep : parent->skip_rep;
 	merged->query_from = ( child->query_from ) ? child->query_from : parent->query_from;
 	merged->query_to = ( child->query_to ) ? child->query_to : parent->query_to;
 	merged->query_sep = ( child->query_sep ) ? child->query_sep : parent->query_sep;
@@ -251,13 +275,14 @@ static void *merge_server_config( apr_pool_t *p, void *parent_conf, void *newloc
 
 
 /* MARK: Command Directive */
-static const char *cmd_set_amend_skip( cmd_parms *cmd, void *mconfig, const char *from, const char *to )
+static const char *cmd_set_amend_skip( cmd_parms *cmd, void *mconfig, const char *from, const char *to, const char *rep )
 {
 	amend_cfg *cfg = ap_get_module_config( cmd->server->module_config , &amend_module );
 	
 	if( cfg ){
 		cfg->skip_from = from;
 		cfg->skip_to = to;
+		cfg->skip_rep = rep;
 	}
 	
 	return NULL;
@@ -278,7 +303,7 @@ static const char *cmd_set_amend_query( cmd_parms *cmd, void *mconfig, const cha
 
 static const command_rec cmd_table[] =
 {
-	AP_INIT_TAKE2(
+	AP_INIT_TAKE23(
 		"AmendSkip",
 		cmd_set_amend_skip,
 		NULL,
